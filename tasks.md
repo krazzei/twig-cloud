@@ -53,8 +53,12 @@ In `internal/auth/`:
   server stores only their SHA-256 in `access_tokens` / `refresh_tokens`. TTLs come
   from the existing config package (15 min access, 30 day refresh).
 - Refresh rotation: every `/auth/refresh` issues a new refresh token and invalidates
-  the old one. If a client ever presents a token that was already rotated, treat it
-  as stolen and revoke the whole chain for that user and device.
+  the old one. Sessions are per-login, not per device name: a `session_id` column
+  (UUID, added in a later migration) identifies the login chain, and rotations keep
+  it. If a client presents a token that was already rotated, that is a network retry
+  of a lost response only if it arrived within 60s of the redemption — re-issue a
+  fresh pair. Past the window the token was copied, so revoke that session (not
+  every login sharing the device name).
 
 In `internal/api/`, add the handlers and the bearer-token middleware:
 - `POST /auth/register` (email, password, device_name): validate, hash, auto-login,
@@ -285,6 +289,12 @@ Middleware in `internal/api/`: request logging to slog (method, path, status,
 duration, user id), a recovery handler that logs the panic with its stack and returns
 500 JSON, and a `MaxBytesReader` sized to the part size plus slack. The server should
 not be able to panic its way to a dead connection.
+
+Concurrency cap in `internal/auth/`: each argon2id verification allocates 64 MiB, so
+an unbounded burst of logins can OOM a small box. Bound the number of verifications
+running at once with a semaphore (8 in flight is fine); when the cap is reached,
+register and login get a 429 rather than queueing. A test fires concurrent logins
+past the cap and asserts the excess are rejected.
 
 The e2e test is the important part. Write it as a Go test against the real stack
 (in-process server, temp data dir):

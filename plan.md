@@ -49,9 +49,12 @@ DATA_DIR/
 
 ```sql
 users(id TEXT PK, email TEXT UNIQUE, password_hash TEXT, created_at INT)
-access_tokens(token_hash TEXT PK, user_id, device_name, expires_at, created_at)
-refresh_tokens(token_hash TEXT PK, user_id, device_name, expires_at, last_used_at)
+access_tokens(token_hash TEXT PK, user_id, session_id, device_name, expires_at, created_at)
+refresh_tokens(token_hash TEXT PK, user_id, session_id, device_name, expires_at, last_used_at)
   -- opaque 256-bit random tokens, stored hashed; 15-min access / 30-day refresh, rotating
+  -- session_id = one login (UUID); rotations keep it. Logout and reuse revocation
+  -- scope to the session, not the (informational) device name. A redeemed refresh
+  -- token replayed within 60s is re-issued as a network retry, after that it's theft.
 files(hash TEXT PK, size INT, created_at)                 -- CAS metadata
 entries(id TEXT PK,            -- client-generated UUID, stable across moves
         user_id, parent_id NULL, name, type CHECK IN('file','folder'),
@@ -114,8 +117,9 @@ multi-stage Dockerfile.
 *Done when:* migrate test proves idempotency; WAL verified on the file.
 
 **T3 — Auth.** argon2id, opaque token issue/validate (hashed at rest, constant-time),
-all `/auth/*` endpoints, refresh rotation with reuse-detection (old-token reuse revokes the
-chain), auth middleware.
+all `/auth/*` endpoints, refresh rotation with reuse-detection (old-token reuse revokes
+the session; a replay within 60s of the redemption is a network retry and gets a fresh
+pair), per-login sessions, auth middleware.
 *Done when:* httptest suite covers register→login→me, wrong password, expired access token,
 refresh rotation, reuse revocation.
 
@@ -159,7 +163,8 @@ byte accounting, enforced at upload init (413).
 blob survives, quota rejection.
 
 **T11 — Hardening, e2e, packaging.** Request logging + recovery middleware, body size
-limits, panic-free guarantee; **e2e test**: register 2 devices → upload on A → B pulls
+limits, panic-free guarantee, bounded concurrent password verifications (an argon2id
+burst can't OOM the box); **e2e test**: register 2 devices → upload on A → B pulls
 sync → B edits → A pushes → conflict copy verified on both; README (run, config,
 back up = copy `DATA_DIR`); docker-compose with volume; `docs/openapi.yaml` matching the
 real API.

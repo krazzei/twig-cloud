@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -13,6 +12,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/twig/twig-cloud/internal/api"
+	"github.com/twig/twig-cloud/internal/auth"
 	"github.com/twig/twig-cloud/internal/config"
 	"github.com/twig/twig-cloud/internal/database"
 )
@@ -64,9 +65,18 @@ func run() error {
 	}
 	logger.Info("database ready", "path", dbPath, "migrations_applied", applied)
 
+	authSvc, err := auth.NewService(db, auth.Options{
+		AccessTTL:  cfg.AccessTokenTTL,
+		RefreshTTL: cfg.RefreshTokenTTL,
+		Logger:     logger,
+	})
+	if err != nil {
+		return err
+	}
+
 	srv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Port),
-		Handler:           newMux(),
+		Handler:           api.NewHandler(authSvc, logger),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
@@ -93,18 +103,4 @@ func run() error {
 		}
 		return err
 	}
-}
-
-func newMux() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	})
-	return mux
-}
-
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
 }

@@ -4,11 +4,14 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"io/fs"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 	"testing/fstest"
+
+	"github.com/twig/twig-cloud/migrations"
 )
 
 func openTestDB(t *testing.T) (*DB, string) {
@@ -39,8 +42,9 @@ func TestMigrateTwice(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first Migrate: %v", err)
 	}
-	if !slices.Equal(applied, []string{"001_init.sql"}) {
-		t.Fatalf("first Migrate applied %v, want [001_init.sql]", applied)
+	want := []string{"001_init.sql", "002_add_session_id.sql"}
+	if !slices.Equal(applied, want) {
+		t.Fatalf("first Migrate applied %v, want %v", applied, want)
 	}
 
 	applied, err = db.Migrate(ctx)
@@ -55,8 +59,17 @@ func TestMigrateTwice(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&n); err != nil {
 		t.Fatalf("count schema_migrations: %v", err)
 	}
-	if n != 1 {
-		t.Fatalf("schema_migrations has %d rows, want 1", n)
+	if n != 2 {
+		t.Fatalf("schema_migrations has %d rows, want 2", n)
+	}
+
+	for _, table := range []string{"access_tokens", "refresh_tokens"} {
+		var col string
+		err := db.QueryRowContext(ctx,
+			`SELECT name FROM pragma_table_info(?) WHERE name = 'session_id'`, table).Scan(&col)
+		if err != nil || col != "session_id" {
+			t.Errorf("table %s missing session_id column: %q, %v", table, col, err)
+		}
 	}
 
 	for _, table := range []string{
@@ -376,4 +389,75 @@ func countUsers(t *testing.T, db *DB) int {
 		t.Fatalf("count users: %v", err)
 	}
 	return n
+}
+
+// A database created before 002 (token rows already present) must upgrade
+// cleanly, with legacy rows backfilled to the old group identity.
+func TestMigrate002BackfillsLegacyTokens(t *testing.T) {
+	ctx := context.Background()
+	db, _ := openTestDB(t)
+
+	one := fstest.MapFS{}
+	body, err := fs.ReadFile(migrations.FS, "001_init.sql")
+	if err != nil {
+		t.Fatalf("read 001: %v", err)
+	}
+	one["001_init.sql"] = &fstest.MapFile{Data: body}
+	if _, err := db.migrate(ctx, one); err != nil {
+		t.Fatalf("apply 001 only: %v", err)
+	}
+
+	for _, q := range []string{
+		`INSERT INTO users (id, email, password_hash, created_at) VALUES ('u1', 'a@b.c', 'h', 0)`,
+		`INSERT INTO access_tokens (token_hash, user_id, device_name, expires_at, created_at)
+		 VALUES ('a1', 'u1', 'phone', 9999999999, 0)`,
+		`INSERT INTO refresh_tokens (token_hash, user_id, device_name, expires_at, last_used_at)
+		 VALUES ('r1', 'u1', 'phone', 9999999999, 100)`,
+	} {
+		if _, err := db.ExecContext(ctx, q); err != nil {
+			t.Fatalf("exec %q: %v", q, err)
+		}
+	}
+
+	applied, err := db.Migrate(ctx)
+	if err != nil {
+		t.Fatalf("upgrade Migrate: %v", err)
+	}
+	if !slices.Equal(applied, []string{"002_add_session_id.sql"}) {
+		t.Fatalf("upgrade applied %v, want [002_add_session_id.sql]", applied)
+	}
+
+	for table, token := range map[string]string{"access_tokens": "a1", "refresh_tokens": "r1"} {
+		var sid string
+		if err := db.QueryRowContext(ctx,
+			`SELECT session_id FROM `+table+` WHERE token_hash = ?`, token).Scan(&sid); err != nil {
+			t.Fatalf("query %s: %v", table, err)
+		}
+		if sid != "u1:phone" {
+			t.Errorf("%s legacy session_id = %q, want %q", table, sid, "u1:phone")
+		}
+	}
+}
+
+func TestIsUniqueViolation(t *testing.T) {
+	ctx := context.Background()
+	db := migratedTestDB(t)
+	insert := `INSERT INTO users (id, email, password_hash, created_at) VALUES (?, 'a@b.c', 'h', 0)`
+
+	if _, err := db.ExecContext(ctx, insert, "u1"); err != nil {
+		t.Fatalf("first insert: %v", err)
+	}
+	_, err := db.ExecContext(ctx, insert, "u2")
+	if !IsUniqueViolation(err) {
+		t.Fatalf("duplicate email: IsUniqueViolation(%v) = false, want true", err)
+	}
+
+	_, err = db.ExecContext(ctx, `INSERT INTO access_tokens (token_hash, user_id, expires_at, created_at)
+		VALUES ('t', 'no-such-user', 0, 0)`)
+	if err == nil || IsUniqueViolation(err) {
+		t.Fatalf("foreign-key failure: err = %v, want a non-unique error", err)
+	}
+	if IsUniqueViolation(nil) || IsUniqueViolation(errors.New("UNIQUE constraint failed")) {
+		t.Fatal("IsUniqueViolation matched a non-sqlite error")
+	}
 }
