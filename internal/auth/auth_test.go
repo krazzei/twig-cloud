@@ -254,6 +254,124 @@ func TestLogoutEndsOnlyThePresentingSession(t *testing.T) {
 	}
 }
 
+// The service's public error contract: what each call returns on its
+// rejection paths, independent of any HTTP layer.
+func TestServiceErrorContract(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := newTestService(t, &testClock{t: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)})
+
+	if _, _, err := svc.Register(ctx, "a@b.c", "password1", "dev"); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if _, _, err := svc.Register(ctx, "a@b.c", "password1", "dev"); !errors.Is(err, ErrEmailTaken) {
+		t.Errorf("duplicate Register err = %v, want ErrEmailTaken", err)
+	}
+	if _, _, err := svc.Login(ctx, "a@b.c", "wrong-password", "dev"); !errors.Is(err, ErrInvalidCredentials) {
+		t.Errorf("Login(wrong password) err = %v, want ErrInvalidCredentials", err)
+	}
+	if _, _, err := svc.Login(ctx, "ghost@b.c", "wrong-password", "dev"); !errors.Is(err, ErrInvalidCredentials) {
+		t.Errorf("Login(unknown email) err = %v, want ErrInvalidCredentials", err)
+	}
+	if _, err := svc.Refresh(ctx, "never-issued"); !errors.Is(err, ErrInvalidToken) {
+		t.Errorf("Refresh(unknown token) err = %v, want ErrInvalidToken", err)
+	}
+	if _, err := svc.User(ctx, "ghost"); !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("User(unknown id) err = %v, want ErrUserNotFound", err)
+	}
+}
+
+// Simultaneous presentation of the same redeemed token (two tabs, a retry
+// racing the original) must not revoke: BEGIN IMMEDIATE serialises the
+// writers, so the first call stamps the row and the rest land inside the
+// retry grace window and get fresh pairs.
+func TestConcurrentPresentationOfSameToken(t *testing.T) {
+	ctx := context.Background()
+	clock := &testClock{t: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+	svc, _ := newTestService(t, clock)
+	_, first, err := svc.Register(ctx, "a@b.c", "password1", "dev")
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if _, err := svc.Refresh(ctx, first.RefreshToken); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	const n = 5
+	var (
+		wg     sync.WaitGroup
+		mu     sync.Mutex
+		tokens []Tokens
+		fails  int
+	)
+	for range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			tk, err := svc.Refresh(ctx, first.RefreshToken)
+			if err != nil {
+				mu.Lock()
+				fails++
+				mu.Unlock()
+				return
+			}
+			mu.Lock()
+			tokens = append(tokens, tk)
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	if fails != 0 {
+		t.Fatalf("%d of %d concurrent presentations failed", fails, n)
+	}
+	seen := map[string]bool{first.AccessToken: true, first.RefreshToken: true}
+	for _, tk := range tokens {
+		if seen[tk.AccessToken] || seen[tk.RefreshToken] {
+			t.Fatalf("concurrent presentation reused an already issued token")
+		}
+		seen[tk.AccessToken], seen[tk.RefreshToken] = true, true
+		if _, err := svc.Authenticate(ctx, tk.AccessToken); err != nil {
+			t.Errorf("Authenticate(concurrent pair) = %v, want ok", err)
+		}
+	}
+
+	// The storm did not count as theft: past the (fixed) window the old
+	// token is still a replay and revokes the session.
+	clock.Advance(RefreshRetryGrace + time.Second)
+	if _, err := svc.Refresh(ctx, first.RefreshToken); !errors.Is(err, ErrTokenReused) {
+		t.Errorf("post-storm replay err = %v, want ErrTokenReused", err)
+	}
+}
+
+// The grace window is measured from the FIRST redemption and does not slide:
+// a retry inside the window issues a pair but does not reset the clock, so a
+// presentation just past the original window is always theft. Sliding would
+// let an attacker replay one stolen token forever, every 59s. The boundary
+// is inclusive: exactly RefreshRetryGrace after redemption is still a retry.
+func TestGraceWindowIsFixedNotSliding(t *testing.T) {
+	ctx := context.Background()
+	clock := &testClock{t: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+	svc, _ := newTestService(t, clock)
+	_, first, err := svc.Register(ctx, "a@b.c", "password1", "dev")
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if _, err := svc.Refresh(ctx, first.RefreshToken); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	// Exactly at the boundary: still a retry.
+	clock.Advance(RefreshRetryGrace)
+	if _, err := svc.Refresh(ctx, first.RefreshToken); err != nil {
+		t.Fatalf("retry at exactly the grace boundary = %v, want a fresh pair", err)
+	}
+
+	// One second past: the boundary retry did not reset the clock.
+	clock.Advance(time.Second)
+	if _, err := svc.Refresh(ctx, first.RefreshToken); !errors.Is(err, ErrTokenReused) {
+		t.Fatalf("replay past grace err = %v, want ErrTokenReused (window must not slide)", err)
+	}
+}
+
 func openDB(t *testing.T) *database.DB {
 	t.Helper()
 	ctx := context.Background()

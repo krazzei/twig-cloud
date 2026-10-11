@@ -210,6 +210,20 @@ func TestUnknownRoute404(t *testing.T) {
 	expectStatus(t, env.do("GET", "/nope", "", nil), http.StatusNotFound, "")
 }
 
+func TestWrongMethod405(t *testing.T) {
+	env := newTestEnv(t)
+	for _, tc := range []struct{ method, path string }{
+		{"GET", "/auth/register"},
+		{"POST", "/auth/me"},
+		{"GET", "/auth/logout"},
+		{"DELETE", "/auth/login"},
+	} {
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			expectStatus(t, env.do(tc.method, tc.path, "", nil), http.StatusMethodNotAllowed, "")
+		})
+	}
+}
+
 func TestRegisterLoginMe(t *testing.T) {
 	env := newTestEnv(t)
 
